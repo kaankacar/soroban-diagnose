@@ -28,12 +28,170 @@ wrote. This tool does that mechanically, for custom contracts and for the
 built-in Stellar Asset Contract, and **never guesses**: when the wasm has no
 spec or the code is out of range it says so (`resolved_from: null`).
 
+## One engine, three doors
+
+The diagnosis engine is a plain TypeScript library. Everything else is a thin
+surface over it — pick the one that matches where you are when a transaction
+fails:
+
+| You are… | Use | Entry point |
+|---|---|---|
+| a developer in a terminal with a failing tx | **CLI** | `soroban-diagnose tx <hash> --text` |
+| an AI agent / Claude Code session debugging for you | **MCP server** | `diagnose_failure` tool |
+| a service or script that wants to react to failures programmatically | **Library** | `import { diagnose }` |
+
+All three return the same deterministic envelope; the CLI can render it as
+human text, the MCP server compacts it for an agent's context budget.
+
+## Setup
+
+```sh
+git clone https://github.com/kaankacar/soroban-diagnose
+cd soroban-diagnose
+npm install
+npm run build        # emits dist/  (cli.js, mcp.js, library)
+npm link             # optional: makes `soroban-diagnose` and `soroban-diagnose-mcp` global
+```
+
+Node ≥ 20. No API keys, no configuration: the tool only reads public chain
+state over RPC (defaults: SDF testnet / mainnet endpoints; override with
+`--rpc-url`).
+
+## 1. CLI — debugging by hand
+
+There is one subcommand per kind of thing you might be holding when something
+fails:
+
+### You have a transaction hash
+
+```sh
+soroban-diagnose tx <hash> --network testnet --text
+```
+
+Fetches the transaction via RPC, extracts all five error layers, resolves
+contract error codes through the deployed wasm's spec, runs the rule table's
+state lookups (TTLs, trustlines, balances, network limits, auth expirations),
+and prints ranked causes with evidence and a fix. Drop `--text` to get the
+JSON envelope instead (for piping into `jq` or scripts); add `--verbose` for
+every diagnostic event, the full evidence trail, and the hypotheses that were
+checked and **eliminated**.
+
+### You have a failed simulation
+
+Save the `simulateTransaction` response to a file and — important — pass the
+transaction you simulated as well:
+
+```sh
+soroban-diagnose sim --file sim-response.json --request-xdr <envelope-b64> --network testnet
+```
+
+The response alone identifies the host/contract layers; the request envelope
+adds the invocation (contract, function, args, auth), which is what lets the
+state-lookup checks run and *confirm* hypotheses. Without it you still get an
+identity like `soroban.contract.error [TrustlineMissingError]`, but with it
+you get "and account `GAUR…` really holds no `CHAOS` trustline, checked at
+ledger N".
+
+### You have raw XDR
+
+```sh
+soroban-diagnose xdr <base64> --network testnet
+```
+
+Auto-detects what you pasted:
+
+| XDR type | Typical source | What you get |
+|---|---|---|
+| `TransactionResult` | `sendTransaction` ERROR (`errorResultXdr`) | submission-phase diagnosis (`tx.bad_seq`, `tx.too_late`, …) |
+| `TransactionEnvelope` | your unsubmitted/failed tx | **live read-only re-simulation** and a full diagnosis of the result |
+| `TransactionMeta` | archives, dumps | diagnostic-event extraction |
+| `DiagnosticEvent` | logs | single-event decode |
+
+### You just want a code decoded
+
+```sh
+soroban-diagnose resolve-error CCF543IP…ZKQ3 7 --network testnet
+# → { "resolved": true, "name": "InvalidAmount", "enum_name": "ChaosError",
+#     "doc": "The provided amount is invalid.", "resolved_from": "contractspecv0" }
+```
+
+### Flags and exit codes
+
+- `--network testnet|mainnet|futurenet|local` (default testnet) or `--rpc-url <url>`
+- `--json` (default) / `--text` / `--verbose`
+- `--rules <path>` — swap in your own rule table without rebuilding
+- `--narrate` — append model-written prose *after* the structured output
+  (needs `ANTHROPIC_API_KEY`; never alters the diagnosis)
+- exit `0` = diagnosed (or the input wasn't a failure), `2` = unresolved,
+  `1` = hard error — safe to branch on in scripts
+
+## 2. MCP server — letting an agent debug
+
+This is the surface the tool was designed around: an agent that debugs
+correctly but burns twenty tool calls and ten minutes doing it is a churn
+source; this collapses that loop into one call.
+
+Register it once (Claude Code shown; any MCP client works the same way over
+stdio):
+
+```sh
+claude mcp add soroban-diagnose -- node /absolute/path/to/soroban-diagnose/dist/mcp.js
+```
+
+From then on, in any session you can say *"why did transaction fc5a57ea… fail
+on testnet?"* and the agent calls:
+
+- **`diagnose_failure(input, network, request_xdr?, verbose?)`** — `input` is
+  whatever you have: a 64-hex tx hash, a simulation-response JSON string, or
+  base64 XDR. Returns the envelope, compacted to stay under **~1,500 tokens**
+  (an agent calling this tool is spending its own context); `verbose: true`
+  returns everything.
+- **`resolve_contract_error(contract_id, code, network)`** — just the
+  `Error(Contract, #N)` → name mapping, or `resolved: false` with the reason.
+
+Two design guarantees matter for agent use: every rejection carries a
+machine-readable reason, and `unresolved` is a first-class answer — the tool
+tells the agent "I could not attribute this" rather than hallucinating a
+cause for it to act on. Stable `cause_id`s and `error.id`s mean the agent can
+match on identity instead of parsing prose.
+
+A skill add-on for Claude lives in [`skill/SKILL.md`](skill/SKILL.md) — drop
+it into your skills directory to teach the agent when to reach for the tool
+and how to read the envelope.
+
+## 3. Library — reacting to failures in code
+
+```ts
+import { diagnose } from "soroban-diagnose";
+
+const envelope = await diagnose(
+  { kind: "tx_hash", hash: sendResult.hash },
+  { network: "mainnet" },
+);
+
+// cause_ids are stable identifiers — match on them, not on prose
+const top = envelope.diagnoses[0];
+if (top?.cause_id === "footprint_access_outside_declared" && top.confirmed) {
+  await resimulateAndResubmit(tx);   // the #1 wild failure mode on mainnet
+} else if (envelope.error.contract_error?.name) {
+  log.error(`contract rejected: ${envelope.error.contract_error.name}`, top?.fix?.summary);
+}
+```
+
+Other input kinds: `{ kind: "simulation", response, request_xdr? }` and
+`{ kind: "xdr", base64 }`. Useful options: `rpcUrl`, `rulesPath`,
+`transport` — the latter is a two-method interface all RPC goes through,
+which is how the test suite replays recorded fixtures fully offline, and how
+you could plug in a caching or historical-state backend.
+
+---
+
 ## Design constraints (the point of the architecture)
 
 1. **No LLM anywhere in the resolution path.** Cause ranking, confidence, and
    fix commands come from a deterministic rule table plus state lookups. The
    same input and ledger state always produce byte-identical output, which is
-   what makes the tool testable against a fixed corpus. An optional
+   what makes the tool testable against a fixed corpus. The optional
    `--narrate` flag adds model-written prose *after* the diagnosis exists; it
    can never alter the structured output.
 2. **`unresolved` is a valid answer.** "No rule matched, here is the raw
@@ -72,58 +230,6 @@ The five layers, extracted in order and recorded as `null` when absent:
 The envelope is frozen at `schema_version: "1.0"` and specified in
 [`schema/envelope.schema.json`](schema/envelope.schema.json); every output is
 validated against it in tests, in both full and compact forms.
-
-## Install & use
-
-```sh
-npm install
-npm run build
-
-# CLI
-soroban-diagnose tx <hash> --network testnet          # JSON (compact) by default
-soroban-diagnose tx <hash> --text --verbose           # human view, all evidence
-soroban-diagnose sim --file sim.json --request-xdr <b64>   # simulation + its envelope
-soroban-diagnose xdr <base64>                         # TransactionResult / Envelope / Meta / DiagnosticEvent
-soroban-diagnose resolve-error <contract-id> <code>   # just the name resolution
-
-# exit codes: 0 = diagnosed (or input wasn't a failure), 2 = unresolved, 1 = hard error
-```
-
-Passing `--request-xdr` with a simulation unlocks invocation context (function,
-args, auth) and therefore the state-lookup checks — without it, a simulation
-response alone still yields the host/contract layers.
-
-### MCP server
-
-```sh
-soroban-diagnose-mcp    # stdio transport
-```
-
-Exposes exactly two tools:
-
-- `diagnose_failure(input, network, request_xdr?, verbose?)` — accepts a tx
-  hash, a simulation-response JSON string, or base64 XDR; returns the envelope.
-- `resolve_contract_error(contract_id, code, network)` — returns the enum
-  variant name, doc, and provenance, or `resolved: false` with the reason.
-
-Default responses are compacted to stay under ~1,500 tokens (an agent calling
-this tool is spending its own context); `verbose: true` returns everything.
-
-Claude Code registration:
-
-```sh
-claude mcp add soroban-diagnose -- node /path/to/soroban-diagnose/dist/mcp.js
-```
-
-### Library
-
-```ts
-import { diagnose } from "soroban-diagnose";
-const envelope = await diagnose({ kind: "tx_hash", hash: "..." }, { network: "testnet" });
-```
-
-All RPC goes through a two-method transport interface, so tests inject a
-`ReplayTransport` and run fully offline.
 
 ## The rule table
 
@@ -173,7 +279,7 @@ Semantics enforced by the engine:
 
 ## Testing & the eval harness
 
-Everything runs offline. `fixtures/` holds 30+ **real failures** — produced
+Everything runs offline. `fixtures/` holds 35 **real failures** — produced
 deliberately on testnet (contract errors, wasm panics, budget exhaustion,
 expired/unsigned/mismatched auth, SAC trustline and balance failures,
 submission rejections, fee-bump wrapping) plus wild failures captured from
@@ -186,7 +292,8 @@ npm run eval    # accuracy report vs the acceptance floors, writes eval-report.m
 
 The eval harness enforces: top-1 ≥ 80%, top-3 ≥ 95%, zero confident-wrong
 answers in the high-risk subset (auth / archived entries / budget), and
-deterministic-path latency floors. CI runs both on every push.
+deterministic-path latency floors. CI runs both on every push; the current
+numbers are in [`eval-report.md`](eval-report.md).
 
 ### How to add a fixture
 
@@ -206,7 +313,8 @@ schema/            frozen envelope JSON Schema
 fixtures/          recorded real failures (offline replay corpus)
 test/              vitest suite
 scripts/           dev-only tooling: corpus generation, recording, eval
-FINDINGS.md        what turned out to be hard — read this before scoping the RFP
+docs/              worked debugging walkthroughs from real failures
+FINDINGS.md        what turned out to be hard — read this before scoping further work
 ```
 
 ## License
