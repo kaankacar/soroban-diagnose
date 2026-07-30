@@ -1,0 +1,48 @@
+{
+  "name": "soroban-diagnose",
+  "version": "0.1.0",
+  "description": "Deterministic failure diagnosis for Soroban transactions and simulations: what failed, at which layer, probable root cause with evidence, and a fix.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "soroban-diagnose": "dist/cli.js",
+    "soroban-diagnose-mcp": "dist/mcp.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "rules",
+    "schema",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "eval": "tsx scripts/eval.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "cli": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@stellar/stellar-sdk": "^16.2.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "commander": "^14.0.0",
+    "yaml": "^2.8.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

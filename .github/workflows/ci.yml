@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Type check
+        run: npm run lint
+      - name: Unit + fixture replay tests (offline, no network)
+        run: npm test
+      - name: Eval harness (accuracy floors)
+        run: npm run eval
+      - name: Publish eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.md

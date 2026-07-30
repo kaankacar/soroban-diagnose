@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/soroban-diagnose/schema/envelope-1.0.json",
+  "title": "soroban-diagnose envelope",
+  "description": "Normalized diagnosis for a failed Soroban transaction or simulation. Frozen at schema_version 1.0: additive optional fields bump the minor, anything else bumps the major.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "network",
+    "protocol_version",
+    "input",
+    "status",
+    "error",
+    "diagnostic_events",
+    "diagnoses",
+    "eliminated",
+    "unresolved",
+    "references",
+    "transaction"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "network": { "type": "string", "minLength": 1 },
+    "protocol_version": { "type": ["integer", "null"], "minimum": 0 },
+    "input": {
+      "type": "object",
+      "required": ["kind", "ref"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["tx_hash", "simulation", "xdr"] },
+        "ref": { "type": ["string", "null"] }
+      }
+    },
+    "status": {
+      "type": "object",
+      "required": ["tx", "op", "phase", "successful"],
+      "additionalProperties": false,
+      "properties": {
+        "tx": { "type": ["string", "null"] },
+        "op": { "type": ["string", "null"] },
+        "phase": { "enum": ["submission", "simulation", "apply", "unknown"] },
+        "successful": { "type": "boolean" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["id", "layer", "raw", "host_error", "contract_error"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": ["string", "null"], "pattern": "^[a-z0-9_.]+$" },
+        "layer": { "enum": ["tx", "op", "host", "contract", "diagnostic", null] },
+        "raw": { "type": ["string", "null"] },
+        "host_error": {
+          "type": ["object", "null"],
+          "required": ["type", "code"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": "string" },
+            "code": { "type": "string" }
+          }
+        },
+        "contract_error": {
+          "type": ["object", "null"],
+          "required": ["contract_id", "code", "name", "doc", "enum_name", "resolved_from"],
+          "additionalProperties": false,
+          "properties": {
+            "contract_id": { "type": ["string", "null"] },
+            "code": { "type": "integer", "minimum": 0 },
+            "name": { "type": ["string", "null"] },
+            "doc": { "type": ["string", "null"] },
+            "enum_name": { "type": ["string", "null"] },
+            "resolved_from": { "enum": ["contractspecv0", "sac_builtin", null] }
+          }
+        }
+      }
+    },
+    "diagnostic_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["contract_id", "type", "topics", "data", "in_successful_contract_call"],
+        "additionalProperties": false,
+        "properties": {
+          "contract_id": { "type": ["string", "null"] },
+          "type": { "type": "string" },
+          "topics": { "type": "array" },
+          "data": {},
+          "in_successful_contract_call": { "type": "boolean" }
+        }
+      }
+    },
+    "diagnoses": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnosis" }
+    },
+    "eliminated": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cause_id", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "cause_id": { "type": "string" },
+          "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } }
+        }
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reason", "detail"],
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "enum": [
+              "no_rule_matched",
+              "rule_checks_unavailable",
+              "layer_missing",
+              "contract_error_unresolved",
+              "input_incomplete",
+              "not_a_failure",
+              "unsupported"
+            ]
+          },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "references": { "type": "array", "items": { "type": "string" } },
+    "transaction": {
+      "type": ["object", "null"],
+      "required": [
+        "hash",
+        "ledger",
+        "created_at",
+        "source_account",
+        "fee",
+        "resources",
+        "footprint",
+        "invocation",
+        "auth",
+        "operations",
+        "failed_operation_index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "hash": { "type": ["string", "null"] },
+        "ledger": { "type": ["integer", "null"] },
+        "created_at": { "type": ["number", "null"] },
+        "source_account": { "type": ["string", "null"] },
+        "fee": { "type": ["string", "null"] },
+        "resources": {
+          "type": ["object", "null"],
+          "required": ["instructions", "disk_read_bytes", "write_bytes", "resource_fee"],
+          "additionalProperties": false,
+          "properties": {
+            "instructions": { "type": "integer" },
+            "disk_read_bytes": { "type": "integer" },
+            "write_bytes": { "type": "integer" },
+            "resource_fee": { "type": "string" }
+          }
+        },
+        "footprint": {
+          "type": ["object", "null"],
+          "required": ["read_only", "read_write"],
+          "additionalProperties": false,
+          "properties": {
+            "read_only": { "type": "array", "items": { "$ref": "#/$defs/footprint_key" } },
+            "read_write": { "type": "array", "items": { "$ref": "#/$defs/footprint_key" } }
+          }
+        },
+        "invocation": {
+          "type": ["object", "null"],
+          "required": ["contract_id", "function_name", "args", "host_function_type"],
+          "additionalProperties": false,
+          "properties": {
+            "contract_id": { "type": ["string", "null"] },
+            "function_name": { "type": ["string", "null"] },
+            "args": { "type": "array" },
+            "host_function_type": { "type": "string" }
+          }
+        },
+        "auth": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "credential_type",
+              "address",
+              "nonce",
+              "signature_expiration_ledger",
+              "signed",
+              "root_invocation"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "credential_type": { "enum": ["source_account", "address"] },
+              "address": { "type": ["string", "null"] },
+              "nonce": { "type": ["string", "null"] },
+              "signature_expiration_ledger": { "type": ["integer", "null"] },
+              "signed": { "type": ["boolean", "null"] },
+              "root_invocation": { "type": "string" }
+            }
+          }
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "index"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "type": "string" },
+              "index": { "type": "integer" }
+            }
+          }
+        },
+        "failed_operation_index": { "type": ["integer", "null"] }
+      }
+    }
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "required": ["type", "source", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "source": { "type": "string" },
+        "outcome": { "enum": ["confirmed", "refuted", "unavailable", "info"] },
+        "key": { "type": "string" },
+        "observed": {},
+        "expected": {},
+        "detail": { "type": "string" }
+      }
+    },
+    "diagnosis": {
+      "type": "object",
+      "required": ["cause_id", "confidence", "confirmed", "explanation", "evidence", "fix", "verify", "references"],
+      "additionalProperties": false,
+      "properties": {
+        "cause_id": { "type": "string", "minLength": 1 },
+        "confidence": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "confirmed": { "type": "boolean" },
+        "explanation": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+        "fix": {
+          "type": ["object", "null"],
+          "required": ["summary", "commands"],
+          "additionalProperties": false,
+          "properties": {
+            "summary": { "type": "string" },
+            "commands": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "verify": { "type": "array", "items": { "type": "string" } },
+        "references": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "footprint_key": {
+      "type": "object",
+      "required": ["type", "summary", "xdr"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "summary": { "type": "string" },
+        "xdr": { "type": "string" },
+        "contract_id": { "type": "string" },
+        "durability": { "type": "string" },
+        "scval_xdr": { "type": "string" }
+      }
+    }
+  }
+}

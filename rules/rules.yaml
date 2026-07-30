@@ -1,0 +1,1124 @@
+# soroban-diagnose rule table.
+#
+# Rules are data, not code: this file is versioned independently and can be
+# updated without a code release. Ordering matters only for tie-breaking
+# (earlier rule wins at equal confidence), so keep specific rules above
+# generic fallbacks.
+#
+# Semantics (enforced by the engine):
+#   - `match` conditions AND together; list values OR within a condition.
+#   - A rule whose checks produce one refutation is eliminated entirely.
+#   - A rule with no confirming evidence is capped at confidence 0.5.
+#   - `conclusive: true` marks matches that are definitive by themselves
+#     (1:1 result-code causes, submission rejections). Contract-layer rules
+#     must instead confirm through checks (usually wasm_spec).
+
+version: 0.1.0
+
+rules:
+  # ---------------------------------------------------------------- #
+  # Simulation: archived entries needing restore                      #
+  # ---------------------------------------------------------------- #
+
+  - id: sim.entry_archived_restore_required
+    protocol: ">=20"
+    match:
+      has_restore_preamble: true
+    checks:
+      - kind: restore_preamble
+        assert: present
+    confidence: 0.98
+    explanation: >
+      The simulation itself succeeded, but one or more persistent ledger
+      entries this transaction touches are archived (their TTL expired).
+      They must be restored before the transaction can run.
+    fix:
+      summary: >
+        Submit a RestoreFootprint transaction using the simulation's
+        restorePreamble (transactionData + minResourceFee of at least
+        {restore_min_fee}), then re-simulate and submit the original call.
+        Most SDKs automate this: check for restorePreamble before sending.
+      commands:
+        - "stellar contract restore --id {contract_id} --key-xdr {key_scval} --durability persistent --source <your-key> --network {network}"
+    verify:
+      - "stellar contract read --id {contract_id} --key-xdr {key_scval} --durability persistent --network {network}"
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/storage/state-archival"
+
+  # ---------------------------------------------------------------- #
+  # Operation layer: InvokeHostFunction                               #
+  # ---------------------------------------------------------------- #
+
+  - id: entry_archived
+    protocol: ">=20"
+    match:
+      op_result: INVOKE_HOST_FUNCTION_ENTRY_ARCHIVED
+    checks:
+      - kind: ttl
+        target: footprint.all
+        assert: expired
+    confidence: 0.95
+    explanation: >
+      A persistent ledger entry in this transaction's footprint is archived:
+      its time-to-live expired before the transaction ran ({key}). Archived
+      entries must be restored before they can be accessed.
+    fix:
+      summary: Restore the archived entry, then resubmit the transaction.
+      commands:
+        - "stellar contract restore --id {key_contract_id} --key-xdr {key_scval} --durability persistent --source <your-key> --network {network}"
+    verify:
+      - "stellar contract read --id {key_contract_id} --key-xdr {key_scval} --durability persistent --network {network}"
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/storage/state-archival"
+
+  - id: insufficient_refundable_fee
+    protocol: ">=20"
+    match:
+      op_result: INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE
+    checks:
+      - kind: declared_resources
+        assert: present
+    confidence: 0.9
+    explanation: >
+      The declared resource fee ({resource_fee} stroops) did not leave enough
+      refundable headroom for the events, return value, and rent this
+      execution produced. The refundable portion is charged at apply time,
+      so a fee that passed validation can still be too small.
+    fix:
+      summary: >
+        Re-simulate the transaction and use the returned minResourceFee
+        (plus margin) as the soroban resource fee, then resubmit. If you
+        modified the transaction after assembling it from a simulation,
+        re-assemble instead of reusing stale soroban data.
+      commands:
+        - "stellar contract invoke --id {contract_id} --source <your-key> --network {network} -- {function} <args>  # re-simulates and prices automatically"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: resource_limit_declared_too_low
+    protocol: ">=20"
+    match:
+      op_result: INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED
+    checks:
+      - kind: resource_headroom
+        target: instructions
+        assert: below_network_max
+    confidence: 0.85
+    explanation: >
+      Execution exceeded a declared resource limit (instructions, disk reads,
+      or write bytes). The transaction declared {declared_instructions}
+      instructions, below the network cap of {network_max_instructions}, so
+      the declaration — not the network — was the binding limit. This usually
+      means state or arguments changed between simulation and submission.
+    fix:
+      summary: >
+        Re-simulate immediately before submitting so declared resources match
+        real execution, or add a safety margin to simulated resources.
+      commands:
+        - "stellar contract invoke --id {contract_id} --source <your-key> --network {network} -- {function} <args>"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: resource_limit_at_network_cap
+    protocol: ">=20"
+    match:
+      op_result: INVOKE_HOST_FUNCTION_RESOURCE_LIMIT_EXCEEDED
+    checks:
+      - kind: resource_headroom
+        target: instructions
+        assert: at_network_max
+    confidence: 0.9
+    explanation: >
+      Execution exceeded resource limits and the transaction already declared
+      the network per-transaction cap ({network_max_instructions}
+      instructions). The workload does not fit in a single transaction on
+      this network.
+    fix:
+      summary: >
+        Reduce the work per invocation: batch less, paginate storage access,
+        or split the operation across multiple transactions.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: invoke_malformed
+    protocol: ">=20"
+    match:
+      op_result: INVOKE_HOST_FUNCTION_MALFORMED
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      The InvokeHostFunction operation was structurally invalid before
+      execution: a malformed host function, invalid footprint, or
+      inconsistent soroban transaction data.
+    fix:
+      summary: >
+        Rebuild the transaction with the SDK or CLI rather than hand-crafting
+        XDR, and assemble it from a fresh simulation.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  # ---------------------------------------------------------------- #
+  # Host layer: budget                                                #
+  # ---------------------------------------------------------------- #
+
+  - id: budget_exceeded_declared_too_low
+    protocol: ">=20"
+    match:
+      host_error: Budget.ExceededLimit
+      phase: apply
+    checks:
+      - kind: resource_headroom
+        target: instructions
+        assert: below_network_max
+    confidence: 0.9
+    explanation: >
+      Execution ran out of its declared CPU budget: the transaction declared
+      {declared_instructions} instructions and execution needed more. The
+      network cap is {network_max_instructions}, so there is headroom — the
+      declaration was simply too low, typically because state or arguments
+      changed after simulation.
+    fix:
+      summary: >
+        Re-simulate immediately before submitting (or add margin to the
+        simulated instruction count) and resubmit.
+      commands:
+        - "stellar contract invoke --id {contract_id} --source <your-key> --network {network} -- {function} <args>"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: budget_exceeded_at_network_cap
+    protocol: ">=20"
+    match:
+      host_error: Budget.ExceededLimit
+      phase: apply
+    checks:
+      - kind: resource_headroom
+        target: instructions
+        assert: at_network_max
+    confidence: 0.9
+    explanation: >
+      Execution ran out of CPU budget with the transaction already at the
+      network per-transaction instruction cap ({network_max_instructions}).
+      This invocation cannot fit in one transaction as written.
+    fix:
+      summary: >
+        Optimize the contract path (fewer storage accesses, cheaper loops) or
+        split the work across transactions.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: budget_exceeded_in_simulation
+    protocol: ">=20"
+    match:
+      host_error: Budget.ExceededLimit
+      phase: simulation
+    checks:
+      - kind: resource_headroom
+        target: instructions
+        assert: sim_at_cap
+    confidence: 0.9
+    explanation: >
+      Simulation ran the invocation against the network per-transaction
+      resource caps and execution exceeded them. No fee or declaration will
+      make this fit: the workload itself is too heavy for one transaction.
+    fix:
+      summary: >
+        Reduce the work per invocation (smaller loops, fewer storage
+        accesses, batching across transactions), then re-simulate.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  # ---------------------------------------------------------------- #
+  # Host layer: auth                                                  #
+  # ---------------------------------------------------------------- #
+
+  - id: auth_signature_expired
+    protocol: ">=20"
+    match:
+      host_error:
+        - Auth.InvalidInput
+        - Auth.InvalidAction
+      diagnostic_contains: "signature has expired"
+    checks:
+      - kind: diagnostic_message
+        contains: "signature has expired"
+        assert: present
+      - kind: auth_expiration
+        assert: expired
+        required: true
+    confidence: 0.95
+    explanation: >
+      A Soroban authorization signature expired: the auth entry for
+      {auth_address} was signed valid only until ledger
+      {sig_expiration_ledger}, and the transaction ran later than that.
+      Auth signatures carry their own expiration ledger, separate from
+      transaction time bounds.
+    fix:
+      summary: >
+        Re-sign the authorization entry with a signatureExpirationLedger
+        comfortably in the future (current ledger {current_ledger} plus your
+        expected submission latency), then rebuild and resubmit.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization"
+
+  - id: auth_entry_not_signed
+    protocol: ">=20"
+    match:
+      host_error: Auth.InvalidAction
+    checks:
+      - kind: auth_signature
+        assert: missing
+        required: true
+    confidence: 0.9
+    explanation: >
+      require_auth failed because the authorization entry for {auth_address}
+      was never signed: the transaction shipped the entry the simulation
+      produced, but no signature payload was attached for that address.
+    fix:
+      summary: >
+        Sign the authorization entry with {auth_address}'s key (SDKs:
+        authorizeEntry / signAuthEntries) before submitting. The transaction
+        signature alone does not cover address-credentialed auth entries.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization"
+
+  - id: auth_nonce_reused
+    protocol: ">=20"
+    match:
+      host_error: Auth.InvalidAction
+      diagnostic_contains: "nonce"
+    checks:
+      - kind: diagnostic_message
+        contains: "nonce"
+        assert: present
+    confidence: 0.85
+    explanation: >
+      The authorization entry's nonce was already consumed — the same signed
+      auth entry cannot be replayed in a second transaction.
+    fix:
+      summary: >
+        Build and sign a fresh authorization entry (new nonce) for each
+        submission; do not reuse signed entries across transactions.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization"
+
+  - id: auth_invocation_mismatch
+    protocol: ">=20"
+    match:
+      host_error: Auth.InvalidAction
+      diagnostic_contains: "Unauthorized function call for address"
+    checks:
+      - kind: diagnostic_message
+        contains: "Unauthorized function call for address"
+        assert: present
+    confidence: 0.85
+    explanation: >
+      require_auth failed for an address because no signed authorization
+      matched the invocation the contract actually made. The classic causes:
+      the transaction was modified after signing (arguments or function
+      changed, invalidating recorded auth), the auth entry was signed for a
+      different call tree, or the address never authorized this call at all.
+    fix:
+      summary: >
+        Rebuild, re-simulate, and re-sign in one pass — never edit a
+        transaction (or its arguments) after assembling it from a simulation,
+        because recorded authorization commits to the exact invocation.
+        Compare the fn_call diagnostic above against what was signed.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization"
+
+  - id: auth_failed_generic
+    protocol: ">=20"
+    match:
+      host_error: Auth.InvalidAction
+    checks: []
+    confidence: 0.5
+    explanation: >
+      A require_auth check failed. Common causes, in observed order of
+      likelihood: the invocation the user signed does not match the
+      invocation the contract actually made (arguments or call tree differ),
+      the auth entry was signed by the wrong key, or a sub-invocation was
+      not covered by the signed root invocation.
+    fix:
+      summary: >
+        Compare the signed root invocation against what the contract invokes
+        (the diagnostic events above show the actual call tree), and re-sign
+        with the exact tree. When testing by hand, `stellar contract invoke`
+        signs matching entries automatically for its --source key.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization"
+
+  # ---------------------------------------------------------------- #
+  # Host layer: storage                                               #
+  # ---------------------------------------------------------------- #
+
+  - id: contract_not_deployed
+    protocol: ">=20"
+    match:
+      host_error: Storage.MissingValue
+      diagnostic_contains: "contract instance"
+    checks:
+      - kind: account
+        target: "diagnostic"
+        assert: missing
+    confidence: 0.9
+    explanation: >
+      The invocation referenced a contract that does not exist on {network}:
+      no contract instance ledger entry was found. Either the contract id is
+      wrong, it was never deployed to this network, or its instance has been
+      archived and evicted.
+    fix:
+      summary: >
+        Verify the contract id and the target network. If you deployed to a
+        different network (testnet vs mainnet), point at the right one; if
+        the instance was archived, restore it.
+      commands:
+        - "stellar contract info interface --id <contract-id> --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: storage_missing_value_generic
+    protocol: ">=20"
+    match:
+      host_error: Storage.MissingValue
+    checks: []
+    confidence: 0.5
+    explanation: >
+      The host could not find a ledger entry the execution required
+      (Error(Storage, MissingValue)). This usually means reading storage that
+      was never written, a wasm hash that is not installed, or a contract id
+      that does not exist on this network.
+    fix:
+      summary: >
+        Check the diagnostic events above for which entry was missing, then
+        verify the contract id, network, and that initialization/setup
+        transactions actually ran.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: footprint_access_outside_declared
+    protocol: ">=20"
+    match:
+      host_error: Storage.ExceededLimit
+      phase: apply
+    checks:
+      - kind: diagnostic_message
+        contains: "footprint"
+        assert: present
+    confidence: 0.9
+    explanation: >
+      Execution tried to access a ledger entry that was not declared in the
+      transaction's footprint. The footprint is computed at simulation time,
+      so this almost always means execution took a different path than the
+      simulation did — because on-chain state or effective arguments changed
+      in between, or because soroban data was reused from a stale or
+      different simulation.
+    fix:
+      summary: >
+        Re-simulate immediately before submitting and assemble the
+        transaction from that fresh simulation. Never edit invocation
+        arguments after assembling.
+      commands:
+        - "stellar contract invoke --id {contract_id} --source <your-key> --network {network} -- {function} <args>"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  # ---------------------------------------------------------------- #
+  # Host layer: VM / values / context                                 #
+  # ---------------------------------------------------------------- #
+
+  - id: contract_panicked
+    protocol: ">=20"
+    match:
+      host_error: WasmVm.InvalidAction
+    checks:
+      - kind: diagnostic_message
+        contains: "trap"
+        assert: present
+    confidence: 0.8
+    explanation: >
+      The contract panicked without a typed error code — a plain panic!, a
+      failed unwrap/expect, an assertion, arithmetic overflow with checks
+      enabled, or an invocation argument that failed type conversion inside
+      the contract (wrong ScVal type for the parameter) all compile to the
+      same wasm trap. The diagnostic events above show the call and its
+      arguments; check argument types against the contract interface first,
+      then reproduce locally.
+    fix:
+      summary: >
+        Reproduce locally with the same arguments in a Rust test and find
+        the panicking line; prefer returning typed contract errors
+        (contracterror) over panics so callers get a diagnosable code.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: function_not_found
+    protocol: ">=20"
+    match:
+      host_error:
+        - Context.MissingValue
+        - WasmVm.MissingValue
+      diagnostic_contains: "non-existent contract function"
+    checks:
+      - kind: diagnostic_message
+        contains: "non-existent contract function"
+        assert: present
+    confidence: 0.92
+    explanation: >
+      The invoked function "{function}" is not exported by the deployed
+      contract. Either the function name is misspelled, or the deployed wasm
+      is an older build without it.
+    fix:
+      summary: >
+        List the contract's actual interface and call an exported function,
+        or deploy the wasm version that includes "{function}".
+      commands:
+        - "stellar contract info interface --id {contract_id} --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: argument_type_mismatch
+    protocol: ">=20"
+    match:
+      host_error:
+        - Value.UnexpectedType
+        - Object.UnexpectedType
+        - Value.InvalidInput
+    checks: []
+    confidence: 0.5
+    explanation: >
+      A value failed to convert to the type the contract expected — usually
+      an invocation argument of the wrong ScVal type (e.g. a string passed
+      where a u32 or Address is required), or the wrong number of arguments.
+    fix:
+      summary: >
+        Compare your argument types against the contract interface and fix
+        the mismatched argument.
+      commands:
+        - "stellar contract info interface --id {contract_id} --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: crypto_verification_failed
+    protocol: ">=20"
+    match:
+      host_error: Crypto.InvalidInput
+    checks: []
+    confidence: 0.5
+    explanation: >
+      A cryptographic host function rejected its input — typically a
+      signature verification failure or malformed key/signature bytes inside
+      contract logic (distinct from Soroban authorization failures, which
+      surface as Auth errors).
+    fix:
+      summary: >
+        Check the key, message, and signature bytes the contract passes to
+        the crypto host functions; the diagnostic events show the failing
+        call.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  # ---------------------------------------------------------------- #
+  # Contract layer: Stellar Asset Contract                            #
+  # ---------------------------------------------------------------- #
+
+  - id: sac_trustline_missing
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: TrustlineMissingError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: trustline
+        target: "arg:1"
+        assert: missing
+        required: true
+    confidence: 0.95
+    explanation: >
+      The Stellar Asset Contract rejected the call with
+      TrustlineMissingError: the destination account holds no trustline for
+      {asset}. Classic accounts must opt in to an asset before they can
+      receive it.
+    fix:
+      summary: >
+        Have the destination account add a trustline for {asset}, then retry
+        the transfer.
+      commands:
+        - "stellar tx new change-trust --source <destination-key> --line {asset} --network {network}"
+    verify:
+      - "stellar contract invoke --id {contract_id} --source <any-key> --network {network} -- balance --id {account}"
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_balance_insufficient
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: BalanceError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: trustline
+        target: "arg:0"
+        assert: balance_below_amount
+        required: true
+    confidence: 0.9
+    explanation: >
+      The Stellar Asset Contract rejected the transfer with BalanceError:
+      the sender's {asset} balance ({balance}) is below the attempted amount
+      ({amount}).
+    fix:
+      summary: >
+        Reduce the transfer amount or fund the sender with more {asset}.
+        Remember classic trustline balances may be partially locked by
+        selling liabilities.
+    verify:
+      - "stellar contract invoke --id {contract_id} --source <any-key> --network {network} -- balance --id {account}"
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_receiver_line_full
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: BalanceError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: trustline
+        target: "arg:1"
+        assert: limit_exceeded
+        required: true
+    confidence: 0.85
+    explanation: >
+      The Stellar Asset Contract rejected the transfer with BalanceError on
+      the receiving side: the destination's trustline limit ({limit}) cannot
+      absorb the incoming amount ({amount}).
+    fix:
+      summary: >
+        Raise the destination's trustline limit for {asset} or send a
+        smaller amount.
+      commands:
+        - "stellar tx new change-trust --source <destination-key> --line {asset} --limit <higher-limit> --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_sender_deauthorized
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name:
+        - BalanceDeauthorizedError
+        - UnauthorizedError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: trustline
+        target: "arg:0"
+        assert: deauthorized
+        required: true
+    confidence: 0.9
+    explanation: >
+      The sender's {asset} trustline is deauthorized — the asset issuer has
+      revoked (or never granted) authorization, so the balance cannot be
+      spent.
+    fix:
+      summary: >
+        The asset issuer must authorize the trustline (SetTrustLineFlags with
+        the authorized flag) before this account can transact in {asset}.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_receiver_deauthorized
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name:
+        - BalanceDeauthorizedError
+        - UnauthorizedError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: trustline
+        target: "arg:1"
+        assert: deauthorized
+        required: true
+    confidence: 0.88
+    explanation: >
+      The destination's {asset} trustline is deauthorized — the issuer has
+      not authorized that account to hold the asset, so it cannot receive.
+    fix:
+      summary: >
+        The asset issuer must authorize the destination's trustline
+        (SetTrustLineFlags) before it can receive {asset}.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_account_missing
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: AccountMissingError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+      - kind: account
+        target: "arg:1"
+        assert: missing
+        required: true
+    confidence: 0.95
+    explanation: >
+      The Stellar Asset Contract referenced a classic account that does not
+      exist on {network} — typically the destination of a transfer that was
+      never created and funded.
+    fix:
+      summary: >
+        Create and fund the account first (on testnet, friendbot can do it),
+        then retry.
+      commands:
+        - "stellar tx new create-account --source <funder-key> --destination {account} --starting-balance 10000000 --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_negative_amount
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: NegativeAmountError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+    confidence: 0.9
+    explanation: >
+      A negative amount was passed to the Stellar Asset Contract; amounts
+      must be non-negative i128 values in the asset's smallest unit.
+    fix:
+      summary: Validate amounts client-side before invoking; send a non-negative amount.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_allowance_insufficient
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name: AllowanceError
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+    confidence: 0.85
+    explanation: >
+      A transfer_from/burn_from style call exceeded the spender's approved
+      allowance for {asset}, or the allowance's expiration ledger is in the
+      past.
+    fix:
+      summary: >
+        Have the balance owner approve a sufficient allowance with a live
+        expiration ledger, then retry.
+      commands:
+        - "stellar contract invoke --id {contract_id} --source <owner-key> --network {network} -- approve --from <owner> --spender <spender> --amount <amount> --expiration_ledger <future-ledger>"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/tokens/stellar-asset-contract"
+
+  - id: sac_insufficient_reserve
+    protocol: ">=20"
+    match:
+      sac: true
+      contract_error_name:
+        - InsufficientAccountReserve
+        - TooManyAccountSubentries
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+    confidence: 0.85
+    explanation: >
+      The classic account cannot take on the required ledger entry: it lacks
+      XLM for the base reserve, or it is at the subentry limit.
+    fix:
+      summary: >
+        Fund the account with more XLM (each subentry locks one base
+        reserve), or remove unused subentries (trustlines, offers, data).
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/lumens#base-reserves"
+
+  # ---------------------------------------------------------------- #
+  # Contract layer: custom contracts                                  #
+  # ---------------------------------------------------------------- #
+
+  - id: contract_error_resolved
+    protocol: ">=20"
+    match:
+      error_id: soroban.contract.error
+      sac: false
+    checks:
+      - kind: wasm_spec
+        assert: resolved
+    confidence: 0.9
+    explanation: >
+      The contract {contract_id} returned Error(Contract, #{code}), which its
+      published spec names {enum_name}.{error_name}. {error_doc}
+    fix:
+      summary: >
+        This is the contract's own typed error: address the condition
+        "{error_name}" describes (see the contract's documentation or
+        source), then retry. The diagnostic events above show the failing
+        call and its arguments.
+      commands:
+        - "stellar contract info interface --id {contract_id} --network {network}"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/errors"
+
+  - id: contract_error_unresolved
+    protocol: ">=20"
+    match:
+      error_id: soroban.contract.error
+    checks:
+      - kind: wasm_spec
+        assert: unresolved
+    confidence: 0.5
+    explanation: >
+      The contract returned Error(Contract, #{code}), but the numeric code
+      could not be mapped to a name: the deployed wasm has no matching error
+      enum in its contractspecv0 section (or no spec at all). The code's
+      meaning is defined by the contract's source.
+    fix:
+      summary: >
+        Look up code {code} in the contract's source (its #[contracterror]
+        enum). If you maintain the contract, build with a current SDK so the
+        spec embeds error enums, making codes self-describing.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/errors"
+
+  # ---------------------------------------------------------------- #
+  # Transaction layer (mostly submission-time rejections)             #
+  # ---------------------------------------------------------------- #
+
+  - id: tx_insufficient_fee
+    match:
+      tx_result: txINSUFFICIENT_FEE
+    conclusive: true
+    confidence: 0.95
+    explanation: >
+      The inclusion fee bid ({fee} stroops) was below what the network
+      currently requires — either under the 100 stroop/op minimum or below
+      the surge-pricing floor at submission time.
+    fix:
+      summary: >
+        Raise the fee and resubmit. Query current fee stats and bid at least
+        the p50 inclusion fee; during surge pricing, bid higher or wait.
+      commands:
+        - "curl -s -X POST <rpc-url> -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getFeeStats\"}'"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering"
+
+  - id: tx_bad_seq
+    match:
+      tx_result: txBAD_SEQ
+    checks:
+      - kind: account
+        target: source
+        assert: exists
+    conclusive: true
+    confidence: 0.95
+    explanation: >
+      The transaction's sequence number does not match the source account's
+      next sequence. Another transaction from {source} likely consumed the
+      sequence first (parallel submission), or the account state was stale
+      when the transaction was built.
+    fix:
+      summary: >
+        Refetch the account and rebuild the transaction with the current
+        sequence + 1. If you run parallel submitters, serialize per-account
+        or use distinct channel accounts.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions"
+
+  - id: tx_too_late
+    match:
+      tx_result: txTOO_LATE
+    conclusive: true
+    confidence: 0.95
+    explanation: >
+      The transaction's time bounds expired before it reached a ledger: its
+      maxTime is in the past. Signed transactions age out; this one can never
+      be included.
+    fix:
+      summary: >
+        Rebuild with fresh time bounds (a 30–300s window is typical), re-sign
+        and resubmit.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions/operations-and-transactions#time-bounds"
+
+  - id: tx_too_early
+    match:
+      tx_result: txTOO_EARLY
+    conclusive: true
+    confidence: 0.95
+    explanation: >
+      The transaction's minTime is in the future: it was submitted before its
+      validity window opened.
+    fix:
+      summary: Wait until minTime passes, or rebuild with an earlier window.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions/operations-and-transactions#time-bounds"
+
+  - id: tx_bad_auth
+    match:
+      tx_result: txBAD_AUTH
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      The transaction signatures do not satisfy the source account's signing
+      requirements: wrong key, missing co-signer, or thresholds not met. (For
+      Soroban require_auth failures you would see an Auth host error instead;
+      this one is classic envelope signature checking.)
+    fix:
+      summary: >
+        Sign with the correct key(s) for {source} on the right network
+        passphrase, and check the account's signers and thresholds. A wrong
+        network passphrase produces exactly this error with a "correct" key.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions/signatures-multisig"
+
+  - id: tx_no_source_account
+    match:
+      tx_result: txNO_ACCOUNT
+    checks:
+      - kind: account
+        target: source
+        assert: missing
+    confidence: 0.95
+    explanation: >
+      The source account {source} does not exist on {network} — it was never
+      created/funded there (or was merged away).
+    fix:
+      summary: >
+        Fund the account on this network first (friendbot on testnet), or
+        check that you are submitting to the network the account lives on.
+      commands:
+        - "curl -s 'https://friendbot.stellar.org/?addr={source}'  # testnet only"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/accounts"
+
+  - id: tx_insufficient_balance
+    match:
+      tx_result: txINSUFFICIENT_BALANCE
+    checks:
+      - kind: account
+        target: source
+        assert: exists
+    conclusive: true
+    confidence: 0.9
+    explanation: >
+      The source account cannot pay the fee without dipping below its
+      minimum XLM reserve (base reserve × (2 + subentries) plus liabilities).
+    fix:
+      summary: >
+        Add XLM to {source} or lower the fee bid; remember reserves rise with
+        each trustline, offer, and data entry.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/lumens#minimum-balance"
+
+  - id: tx_soroban_invalid
+    match:
+      tx_result: txSOROBAN_INVALID
+    conclusive: true
+    confidence: 0.8
+    explanation: >
+      The Soroban transaction data failed validation before execution:
+      missing or malformed sorobanData (footprint, declared resources,
+      resource fee), an inclusion fee that does not cover the resource fee,
+      or a transaction not assembled from a simulation at all.
+    fix:
+      summary: >
+        Simulate the transaction and assemble it from the simulation result
+        (SDK assembleTransaction / CLI does this automatically), rather than
+        submitting a bare invoke.
+      commands:
+        - "stellar contract invoke --id <contract-id> --source <your-key> --network {network} -- <function> <args>"
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/contract-development/errors-and-debugging/debugging-errors"
+
+  - id: tx_malformed
+    match:
+      tx_result: txMALFORMED
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      The transaction envelope is structurally invalid (zero operations,
+      malformed fields, or an operation that failed static validation).
+    fix:
+      summary: Rebuild the transaction with an up-to-date SDK or the CLI instead of hand-built XDR.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions"
+
+  - id: tx_bad_min_seq_age_or_gap
+    match:
+      tx_result: txBAD_MIN_SEQ_AGE_OR_GAP
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      The transaction's minSeqAge / minSeqLedgerGap precondition is not yet
+      satisfied — the source account's sequence changed too recently.
+    fix:
+      summary: Wait for the required age/gap or rebuild without the precondition.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions/operations-and-transactions#preconditions"
+
+  - id: tx_bad_sponsorship
+    match:
+      tx_result: txBAD_SPONSORSHIP
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      Sponsorship bookkeeping is unbalanced: a BeginSponsoringFutureReserves
+      without a matching EndSponsoringFutureReserves (or vice versa) in the
+      same transaction.
+    fix:
+      summary: Pair every begin-sponsoring with an end-sponsoring in the same transaction.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/encyclopedia/transactions-specialized/sponsored-reserves"
+
+  - id: tx_internal_error
+    match:
+      tx_result: txINTERNAL_ERROR
+    checks: []
+    confidence: 0.5
+    explanation: >
+      stellar-core reported an internal error applying this transaction —
+      this is a node-side fault, not something structurally wrong with the
+      transaction itself.
+    fix:
+      summary: >
+        Retry against a healthy node; if it reproduces, report it (with the
+        tx hash) to the network operators.
+    verify: []
+    references: []
+
+  # ---------------------------------------------------------------- #
+  # Operation wrappers + classic fallbacks                            #
+  # ---------------------------------------------------------------- #
+
+  - id: op_bad_auth
+    match:
+      op_result: opBAD_AUTH
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      An operation-level signature check failed: the operation's source
+      account (which differs from the transaction source) has not signed, or
+      signature weight is below the required threshold for that account.
+    fix:
+      summary: >
+        Add a signature from the operation's source account (or enough
+        signers to meet its threshold) and resubmit.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/transactions/signatures-multisig"
+
+  - id: op_no_account
+    match:
+      op_result: opNO_ACCOUNT
+    conclusive: true
+    confidence: 0.85
+    explanation: >
+      An operation references a source account that does not exist on this
+      network.
+    fix:
+      summary: Create/fund the operation's source account or fix the account id.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/learn/fundamentals/accounts"
+
+  - id: payment_underfunded
+    match:
+      op_result: PAYMENT_UNDERFUNDED
+    checks:
+      - kind: account
+        target: source
+        assert: exists
+    conclusive: true
+    confidence: 0.9
+    explanation: >
+      The payment failed because the sending account's available balance
+      (after reserves and liabilities) is below the payment amount.
+    fix:
+      summary: >
+        Send a smaller amount or fund {source}; check that XLM reserves and
+        selling liabilities are not locking the balance you expected to
+        spend.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/data/apis/horizon/api-reference/errors/result-codes/operation-specific/payment"
+
+  - id: payment_no_trust
+    match:
+      op_result: PAYMENT_NO_TRUST
+    conclusive: true
+    confidence: 0.9
+    explanation: >
+      The payment destination holds no trustline for the asset being sent;
+      classic accounts must opt in to non-native assets.
+    fix:
+      summary: Have the destination add a trustline for the asset, then retry.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/data/apis/horizon/api-reference/errors/result-codes/operation-specific/payment"
+
+  - id: classic_op_failed_generic
+    match:
+      error_id: "op.*"
+      error_id_not:
+        - "op.invoke_host_function.*"
+        - "op.extend_footprint_ttl.*"
+        - "op.restore_footprint.*"
+    checks: []
+    confidence: 0.4
+    explanation: >
+      A classic (non-Soroban) operation failed with result code {op_code}.
+      soroban-diagnose focuses on Soroban failures; the result-codes
+      reference explains every classic code.
+    fix:
+      summary: Look up the operation result code in the Horizon result-codes reference.
+    verify: []
+    references:
+      - "https://developers.stellar.org/docs/data/apis/horizon/api-reference/errors/result-codes"
